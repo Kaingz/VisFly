@@ -143,7 +143,7 @@ class PPO(ori_PPO):
             while self.num_timesteps < total_timesteps:
                 self.check_and_reset_scene()
                 prev_timesteps = self.num_timesteps
-                continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+                _t0 = time.time(); continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
 
                 if not continue_training:
                     break
@@ -164,7 +164,7 @@ class PPO(ori_PPO):
                     assert self.ep_info_buffer is not None
                     self._dump_logs(iteration)
 
-                self.train()
+                _t1 = time.time(); self.train(); print(f"\n[timing] collect {_t1 - _t0:.1f}s | train {time.time() - _t1:.1f}s", flush=True)
 
             pbar.close()  # 关闭进度条
             callback.on_training_end()
