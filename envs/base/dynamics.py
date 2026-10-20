@@ -68,11 +68,11 @@ class Dynamics:
         self._is_quat_output = ori_output_type == "quaternion"
         self.dt = dt
         self.ctrl_dt = ctrl_dt
-        if not th.as_tensor(ctrl_dt) % th.as_tensor(dt) == 0:
+        # compare with a tolerance: float modulo rejects e.g. 0.05 % 0.005
+        self._interval_steps = round(ctrl_dt / dt)
+        if abs(self._interval_steps * dt - ctrl_dt) > 1e-9:
             raise ValueError("ctrl_dt should be a multiple of dt")
-
-        self._interval_steps = int(ctrl_dt / dt)
-        self._comm_delay_steps = int(comm_delay / ctrl_dt)
+        self._comm_delay_steps = round(comm_delay / ctrl_dt)
         self._integrator = integrator
         self._ctrl_delay = ctrl_delay
 
@@ -329,12 +329,10 @@ class Dynamics:
 
         command = self._de_normalize(action.to(self.device))
 
-        thrust_des = self._get_thrust_from_cmd(command)  #
-        assert (thrust_des <= self._bd_thrust.max).all()  # debug
-
         for _ in range(self._interval_steps):
-            # thrust_des = self._get_thrust_from_cmd(command)
-            # assert (thrust_des <= self._bd_thrust.max).all()
+            # run the low-level controller every physics step, like the onboard rate loop
+            thrust_des = self._get_thrust_from_cmd(command)
+            assert (thrust_des <= self._bd_thrust.max).all()  # debug
             self._run_motors(thrust_des)
             force_torque = self._B_allocation @ self._thrusts  # 计算力矩
 
