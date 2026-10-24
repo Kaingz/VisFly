@@ -22,25 +22,25 @@
     0.0045
   ],
   "max_rate": 2.0,
-  "max_acc": 1.95,
+  "max_acc": 1.46,
   "max_spd": 10.0,
   "max_pos": 10.0,
   "BODYRAYE_PID": {
     "p": [
       [
-        20.0,
+        90.0,
         0,
         0
       ],
       [
         0,
-        20.0,
+        90.0,
         0
       ],
       [
         0,
         0,
-        10.0
+        5.0
       ]
     ],
     "i": [
@@ -62,13 +62,13 @@
     ],
     "d": [
       [
-        0.0,
+        7e-06,
         0,
         0
       ],
       [
         0,
-        0.0,
+        7.04e-06,
         0
       ],
       [
@@ -94,19 +94,20 @@
     "d": 0.25
   },
   "arm_length": 0.046,
-  "kappa": 0.006,
-  "motor_omega_max": 2500,
+  "kappa": 0.007,
+  "motor_omega_max": 2164,
   "motor_omega_min": 200,
   "motor_tau": 0.07,
   "thrust_map": [
     2.7966e-08,
-    -5.0890e-06,
+    -5.089e-06,
     0.0
   ],
   "_comment_": [
     "Crazyflie 2.1+ (29 g, 47-17 propellers) + AI-deck (4.4 g). Sources and derivations: docs/specs-and-assumptions.md",
     "thrust_map: N per motor vs rad/s, Bitcraze's 2.1 rpm-thrust curve (6k-24k rpm, <2% error) x 1.15 for the 2.1+ propellers",
-    "kappa: yaw torque per newton of thrust (Foerster 2015)",
-    "BODYRAYE_PID: initial guess, tune in phase 3 (physics check)"
+    "kappa: yaw torque per newton of thrust (firmware THRUST2TORQUE, 2.1+ propellers)",
+    "motor_omega_max: 0.12 N per motor = firmware THRUST_MAX with battery compensation (default)",
+    "BODYRAYE_PID: fitted to the firmware rate-loop reference (tools/rate_reference.py): roll/pitch P 90, D 0.4 x inertia; yaw P 5"
   ]
 }
