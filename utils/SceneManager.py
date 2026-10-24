@@ -1023,6 +1023,7 @@ class SceneManager(ABC):
             sensor_spec.resolution = sensor_cfg.get("resolution", [128, 128])
             sensor_spec.orientation = mn.Vector3(sensor_cfg.get("orientation", [0., 0, 0]))
             sensor_spec.position = mn.Vector3(sensor_cfg.get("position", [0, 0, -0.2]))
+            sensor_spec.hfov = sensor_cfg.get("hfov", 90.0)  # horizontal field of view in degrees
             if type(sensor_cfg.get("sensor_type", habitat_sim.SensorType.COLOR)) != habitat_sim._ext.habitat_sim_bindings.SensorType:
                 continue
             sensor_spec.sensor_type = sensor_cfg.get("sensor_type", habitat_sim.SensorType.COLOR)
