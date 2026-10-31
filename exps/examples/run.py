@@ -13,6 +13,7 @@ PROJECT_PARENT = os.path.abspath(os.path.join(PROJECT_ROOT, "../.."))
 sys.path.append(PROJECT_ROOT)
 sys.path.append(PROJECT_PARENT)
 
+from VisFly.envs.GateHoverEnv import GateHoverEnv
 from VisFly.envs.LandingEnv import LandingEnv
 from VisFly.envs.MultiNavigationEnv import MultiNavigationEnv
 from VisFly.envs.NavigationEnv import NavigationEnv
@@ -25,6 +26,8 @@ ENV_ALIAS = {
     "cluttered_flight": NavigationEnv,
     "crossing": MultiNavigationEnv,
     "landing": LandingEnv,
+    "gate_hover_teacher_nominal": GateHoverEnv,
+    "gate_hover_teacher": GateHoverEnv,
 }
 
 ALG_ALIAS = {
@@ -34,6 +37,7 @@ ALG_ALIAS = {
 EXTRACTOR_ALIAS = {
     "StateTargetImageExtractor": extractors.StateTargetImageExtractor,
     "SwarmStateTargetImageExtractor": extractors.SwarmStateTargetImageExtractor,
+    "FlexibleExtractor": extractors.FlexibleExtractor,
 }
 
 TORCH_ALIAS = {
@@ -100,7 +104,14 @@ def main(default_env: str = "cluttered_flight") -> None:
                 save_path=save_folder,
                 **alg_config["algorithm"],
             )
-        model.learn(**alg_config["learn"])
+        learn_config = dict(alg_config["learn"])
+        checkpoint_freq = learn_config.pop("checkpoint_freq", None)  # in environment steps
+        if checkpoint_freq:
+            from stable_baselines3.common.callbacks import CheckpointCallback
+            learn_config["callback"] = CheckpointCallback(
+                save_freq=max(1, checkpoint_freq // env.num_envs),
+                save_path=model.policy_save_path[:-len(".zip")] + "_checkpoints", name_prefix="ckpt")
+        model.learn(**learn_config)
         model.save()
         return
 

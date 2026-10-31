@@ -3,6 +3,7 @@ import torch as th
 from typing import Union, List, Tuple, Optional, Dict
 from abc import ABC
 import os, io, sys
+import math
 import json
 
 sys.path.append(os.getcwd())
@@ -40,7 +41,13 @@ class Dynamics:
             cfg: str = "drone_state",
             wind_settings: Optional[List] = [0,0,0],
             rotor_sim: bool = True,
+            randomization: Optional[Dict] = None,
     ):
+        """randomization: per-drone parameters drawn at every reset, e.g.
+            {"mass": 0.05, "thrust_gain": 0.1, "inertia": 0.15, "kappa": 0.3, "drag": 0.3,  # +- fractions
+             "motor_tau": [0.05, 0.09], "rate_p": [60, 130], "yaw_p": [3, 8],           # ranges
+             "delay": [0.05, 0.2]}                                                         # s, replaces comm_delay
+        Missing keys keep the config's nominal value."""
         assert action_type in ["bodyrate", "thrust", "velocity", "position"]  # 对两个变量进行断言检查
         assert ori_output_type in ["quaternion", "euler"]
 
@@ -72,7 +79,8 @@ class Dynamics:
         self._interval_steps = round(ctrl_dt / dt)
         if abs(self._interval_steps * dt - ctrl_dt) > 1e-9:
             raise ValueError("ctrl_dt should be a multiple of dt")
-        self._comm_delay_steps = round(comm_delay / ctrl_dt)
+        self._comm_delay = comm_delay
+        self._randomization = randomization or {}
         self._integrator = integrator
         self._ctrl_delay = ctrl_delay
 
@@ -90,6 +98,73 @@ class Dynamics:
         self.wind_velocity = None
         self._rotor_sim = rotor_sim
         self._create_wind(wind_settings=wind_settings)
+        self._init_randomization()
+
+    def _init_randomization(self):
+        """Per-drone plant parameters (as factors on the config's nominal values) and the command
+        delay. The controller keeps using the nominal values, like the real firmware does."""
+        n, dev = self.num, self.device
+        self._nominal_tau = 1 / self._motor_tau_inv.item()
+        self._nominal_rate_p = th.diagonal(self._BODYRATE_PID.p).reshape(3, 1).to(dev)
+        self._nominal_rate_d = th.diagonal(self._BODYRATE_PID.d).reshape(3, 1).to(dev)
+        self._mass_f = th.ones((1, n), device=dev)
+        self._thrust_gain = th.ones((1, n), device=dev)
+        self._inertia_f = th.ones((3, n), device=dev)
+        self._kappa_f = th.ones((1, n), device=dev)
+        self._drag_f = th.ones((1, n), device=dev)
+        self._motor_tau = th.full((1, n), self._nominal_tau, device=dev)
+        self._c = th.exp(-self.dt / self._motor_tau)
+        self._rate_p = self._nominal_rate_p.repeat(1, n)
+        self._rate_d = self._nominal_rate_d.repeat(1, n)
+        self._delay = th.full((n,), self._comm_delay, device=dev)
+        max_delay = self._randomization.get("delay", [self._comm_delay, self._comm_delay])[1]
+        # command history, newest first; a command is applied once it is older than the drone's delay
+        self._cmd_buffer_len = math.ceil(round(max_delay / self.dt) / self._interval_steps) + 1
+        self._hover_action = self._normalize(th.tensor([[-g[2].item(), 0., 0., 0.]], device=dev)).float() \
+            if self.action_type == ACTION_TYPE.BODYRATE else th.zeros((1, 4), device=dev)
+        self._cmd_buffer = self._hover_action.reshape(1, 1, 4).repeat(self._cmd_buffer_len, n, 1)
+        self._sample_randomization(th.arange(n, device=dev))
+
+    def _sample_randomization(self, indices):
+        r, k = self._randomization, len(indices)
+        if k == 0:
+            return
+
+        def u(lo, hi, rows=1):
+            return lo + (hi - lo) * th.rand((rows, k), device=self.device)
+
+        def frac(key, rows=1):
+            return u(1 - r[key], 1 + r[key], rows) if key in r else th.ones((rows, k), device=self.device)
+
+        self._mass_f[:, indices] = frac("mass")
+        self._thrust_gain[:, indices] = frac("thrust_gain")
+        self._inertia_f[:, indices] = frac("inertia", 3)
+        self._kappa_f[:, indices] = frac("kappa")
+        self._drag_f[:, indices] = frac("drag")
+        if "motor_tau" in r:
+            self._motor_tau[:, indices] = u(*r["motor_tau"])
+        self._c[:, indices] = th.exp(-self.dt / self._motor_tau[:, indices])
+        p, d = self._nominal_rate_p.repeat(1, k), self._nominal_rate_d.repeat(1, k)
+        if "rate_p" in r:  # roll and pitch together; D scales with P (as in the fit to the firmware)
+            scale = u(*r["rate_p"]) / self._nominal_rate_p[0]
+            p[:2], d[:2] = p[:2] * scale, d[:2] * scale
+        if "yaw_p" in r:
+            scale = u(*r["yaw_p"]) / self._nominal_rate_p[2]
+            p[2:], d[2:] = p[2:] * scale, d[2:] * scale
+        self._rate_p[:, indices], self._rate_d[:, indices] = p, d
+        self._delay[indices] = u(*r["delay"])[0] if "delay" in r else self._comm_delay
+        self._cmd_buffer[:, indices] = self._hover_action
+
+    @property
+    def randomized_params(self):
+        """Per-drone parameters relative to nominal, roughly in [-1, 1] (privileged critic input)."""
+        return th.cat([
+            (self._mass_f - 1) * 10, (self._thrust_gain - 1) * 10, (self._inertia_f - 1) * 5,
+            (self._kappa_f - 1) * 3, (self._drag_f - 1) * 3,
+            (self._motor_tau / self._nominal_tau - 1) * 3,
+            (self._rate_p[:1] / self._nominal_rate_p[0] - 1) * 2, (self._rate_p[2:] / self._nominal_rate_p[2] - 1),
+            (self._delay.reshape(1, -1) - 0.125) / 0.075,
+        ]).T
 
     def _init(self, cfg):
         try:
@@ -121,10 +196,6 @@ class Dynamics:
         self._t = th.zeros((self.num,), device=self.device)
 
         self._angular_acc = th.zeros((3, self.num), device=self.device)
-        self._pre_action = [
-            th.zeros((4, self.num), device=self.device)
-            for _ in range(self._comm_delay_steps)
-        ]
 
         self._linear_drag_coeffs = self._linear_drag_coeffs_mean
         self._quad_drag_coeffs = self._quad_drag_coeffs_mean
@@ -185,9 +256,7 @@ class Dynamics:
         self._acc_z_body = self._acc_z_body.clone().detach()
         self._dacc_z_body = self._dacc_z_body.clone().detach()
         self._t = self._t.clone().detach()
-        self._pre_action = [
-            pre_act.clone().detach() for pre_act in self._pre_action
-        ]
+        self._cmd_buffer = self._cmd_buffer.clone().detach()
 
     def _set_device(self, device):
         self._c = self._c.to(device)
@@ -240,7 +309,7 @@ class Dynamics:
             self._acc = th.zeros((3, self.num), device=self.device)
             self._acc_z_body = th.zeros((1, self.num), device=self.device)
             self._dacc_z_body = th.zeros((1, self.num), device=self.device)
-            self._pre_action = [th.zeros(4, self.num) for _ in range(self._comm_delay_steps)]
+            self._sample_randomization(th.arange(self.num, device=self.device))
             if self._drag_random:
                 self._linear_drag_coeffs = self._linear_drag_coeffs_mean * (((th.rand_like(self._linear_drag_coeffs_mean)-0.5)*2*self._drag_random).clamp(-0.5, .5) + 1)
                 self._quad_drag_coeffs = self._quad_drag_coeffs_mean * (((th.rand_like(self._quad_drag_coeffs_mean)-0.5)*2*self._drag_random).clamp(-0.5, .5) + 1)
@@ -259,8 +328,7 @@ class Dynamics:
             self._acc[:, indices] = th.zeros((3, len(indices)), device=self.device)
             self._acc_z_body[:, indices] = th.zeros((1, len(indices)), device=self.device)
             self._dacc_z_body[:, indices] = th.zeros((1, len(indices)), device=self.device)
-            for i in range(self._comm_delay_steps):
-                self._pre_action[i][:, indices] = self._pre_action[i][:, indices] * 0
+            self._sample_randomization(th.as_tensor(indices, dtype=th.long, device=self.device).reshape(-1))
             
             if self._drag_random:
                 self._linear_drag_coeffs[:, indices] = self._linear_drag_coeffs_mean * (((th.rand_like(self._linear_drag_coeffs_mean[:,indices])-0.5)*2*self._drag_random).clamp(-0.5, .5) + 1)
@@ -319,32 +387,34 @@ class Dynamics:
     def step(self, action) -> Tuple[th.Tensor, th.Tensor]:
         self.update_wind()
 
-        # Add real imu delay
-        if self._comm_delay_steps:
-            self._pre_action.append(action.T.clone())
-            action = self._pre_action[0].T
-            self._pre_action.pop(0)
-        else:
-            action = action
+        # command delay: newest command first in the buffer; within the control step, each drone
+        # applies the newest command that is at least its delay old (physics-step resolution)
+        n = self._interval_steps
+        self._cmd_buffer = th.roll(self._cmd_buffer, 1, dims=0)
+        self._cmd_buffer[0] = action.to(self.device).float()
+        delay_steps = th.round(self._delay / self.dt).long()
+        drones = th.arange(self.num, device=self.device)
 
-        command = self._de_normalize(action.to(self.device))
-
-        for _ in range(self._interval_steps):
+        for j in range(n):
+            age = ((delay_steps - j).clamp(min=0) + n - 1) // n  # control steps back in the buffer
+            command = self._de_normalize(self._cmd_buffer[age.clamp(max=self._cmd_buffer_len - 1), drones])
             # run the low-level controller every physics step, like the onboard rate loop
             thrust_des = self._get_thrust_from_cmd(command)
             assert (thrust_des <= self._bd_thrust.max).all()  # debug
             self._run_motors(thrust_des)
-            force_torque = self._B_allocation @ self._thrusts  # 计算力矩
+            # plant parameters may differ from the nominal ones the controller uses
+            force_torque = self._B_allocation @ (self._thrusts * self._thrust_gain)  # 计算力矩
+            force_torque = th.cat([force_torque[:3], force_torque[3:] * self._kappa_f])
 
             # compute linear acceleration and body torque
             velocity_body = self._orientation.inv_rotate(self._velocity+0)  # (3, N)
             linear_drag = self._linear_drag_coeffs * velocity_body
             quadratic_drag = self._quad_drag_coeffs * velocity_body * velocity_body.abs()
-            drag = linear_drag + quadratic_drag
+            drag = (linear_drag + quadratic_drag) * self._drag_f
             # drag = self._drag_coeffs * (self._orientation.inv_rotate(self._velocity - 0).pow(2))
-            self._acc = self._orientation.rotate(z * force_torque[0] - drag) / self.m + g
+            self._acc = self._orientation.rotate(z * force_torque[0] - drag) / (self.m * self._mass_f) + g
 
-            torque = force_torque[1:]
+            torque = force_torque[1:] / self._inertia_f  # equivalent to a scaled inertia (gyroscopic term nominal)
 
             # integrate the state
             self._position, self._orientation, self._velocity, self._angular_velocity, self._angular_acc = (
@@ -400,9 +470,9 @@ class Dynamics:
             # self._ctrl_i += (self._BODYRATE_PID.i @ (angular_velocity_error * self.dt))
             # self._ctrl_i = self._ctrl_i.clip(min=-3, max=3)
             body_torque_des = \
-                self._inertia @ self._BODYRATE_PID.p @ angular_velocity_error \
+                self._inertia @ (self._rate_p * angular_velocity_error) \
                 + cross(self._angular_velocity + 0, self._inertia @ (self._angular_velocity + 0)) \
-                - self._BODYRATE_PID.d @ self._angular_acc
+                - self._rate_d * self._angular_acc
             # + self._ctrl_i \
 
             # acc_error = command[0:1, :] - self._acc_z_body

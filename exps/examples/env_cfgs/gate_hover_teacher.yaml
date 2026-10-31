@@ -1,0 +1,40 @@
+# Phase 4b: state-based teacher, full randomisation and delay range (docs/specs-and-assumptions.md).
+# Starts, reward and observation details: VisFly/envs/GateHoverEnv.py (defaults) and the keys below.
+env:
+  num_agent_per_scene: 1024
+  num_scene: 1
+  visual: False
+  device: cpu
+  max_episode_steps: 300          # 15 s at 20 Hz
+  hover_distance: 1.0             # m in front of the opening (1 gate width)
+  n_prev_actions: 4               # previous commands in the actor's input (variants A-D)
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335     # 1/300 s, divides 15, 20 and 30 Hz
+    ctrl_dt: 0.05                 # 20 Hz
+    action_type: bodyrate
+    ctrl_delay: True              # motor lag
+    comm_delay: 0.1               # nominal; overridden by randomization.delay
+    randomization:
+      mass: 0.05
+      thrust_gain: 0.10
+      inertia: 0.15
+      kappa: 0.3
+      drag: 0.3
+      motor_tau: [0.05, 0.09]
+      rate_p: [60, 130]
+      yaw_p: [3, 8]
+      delay: [0.05, 0.2]
+
+eval_env:
+  num_agent_per_scene: 16
+  num_scene: 1
+  visual: False
+  device: cpu
+  max_episode_steps: 300
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335
+    ctrl_dt: 0.05
+    action_type: bodyrate
+    comm_delay: 0.1
