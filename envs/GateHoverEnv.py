@@ -6,7 +6,9 @@ parameters (asymmetric actor-critic).
 
 Phase 5 (camera policy, n_frames > 0): the actor sees the last n_frames grayscale camera images
 ("image", uint8, newest first) plus its previous commands ("actions"); the critic sees exactly the
-teacher's inputs ("state", "privileged_state").
+teacher's inputs ("state", "privileged_state"). "corners" holds the training labels for the
+auxiliary corner task (where the opening's corners are in the newest frame); only the PPO loss
+reads it.
 
 Gate geometry, layout and camera projection come from tools/gate_geometry.py (repo root must be
 on sys.path, as in exps/examples/run.py). The gate pose comes from a scene's .gate.json sidecar.
@@ -189,6 +191,8 @@ class GateHoverEnv(DroneGymEnvsBase):
         c, s = math.cos(self.gate_yaw), math.sin(self.gate_yaw)
         self.R_gate = th.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])  # gate -> world
         self.hover_point = th.tensor(gg.hover_point(self.gate_pos, self.gate_yaw, hover_distance), dtype=th.float32)
+        self._opening_w = th.tensor(  # corners TL, TR, BR, BL as seen from the front
+            gg.gate_to_world(gg.gate_keypoints()["opening_front"], self.gate_pos, self.gate_yaw), dtype=th.float32)
         self.opening_centre = th.tensor(
             gg.gate_to_world(gg.gate_keypoints()["opening_center"], self.gate_pos, self.gate_yaw)[0], dtype=th.float32)
         self._build_collision_boxes()
@@ -205,6 +209,7 @@ class GateHoverEnv(DroneGymEnvsBase):
         }
         if n_frames > 0:
             obs_spaces["image"] = spaces.Box(low=0, high=255, shape=(n_frames, image_size, image_size), dtype=np.uint8)
+            obs_spaces["corners"] = spaces.Box(low=-2, high=2, shape=(12,), dtype=np.float32)
             if n_prev_actions > 0:
                 obs_spaces["actions"] = spaces.Box(low=-1, high=1, shape=(4 * n_prev_actions,), dtype=np.float32)
             self._frames = th.zeros((self.num_agent, n_frames, image_size, image_size), dtype=th.uint8)
@@ -256,6 +261,23 @@ class GateHoverEnv(DroneGymEnvsBase):
         ], 1)  # body -> world, (N, 3, 3)
 
     # ---------- camera images ----------
+    def corner_labels(self):
+        """Labels for the auxiliary corner task, (N, 12): the opening's corners TL, TR, BR, BL in the
+        newest frame as (u, v) in normalised image coordinates (the image spans [-1, 1], u right,
+        v down; pixels = (u + 1) * image_size / 2), then 4 flags: 1 if the corner is in front of
+        the camera and inside the image. Coordinates of corners that are not visible are 0.
+        Same pinhole model as tools/gate_geometry.project_points (checked in tools/corner_check.py)."""
+        R = self._rotation_matrices()                                       # body -> world
+        p = self._opening_w[None] - self.position.cpu()[:, None]            # (N, 4, 3), world
+        p_cam = th.einsum("nkw,nwb->nkb", p, R) - th.tensor(gg.CAMERA_OFFSET_BODY, dtype=th.float32)
+        depth = p_cam[..., 0]                                               # body: x forward, y left, z up
+        f = 1.0 / math.tan(math.radians(gg.CAMERA_HFOV_DEG) / 2)           # square image: same for u and v
+        d = depth.clamp(min=1e-3)
+        uv = th.stack([-f * p_cam[..., 1] / d, -f * p_cam[..., 2] / d], -1)
+        visible = (depth > 0.05) & (uv.abs() <= 1).all(-1)
+        uv = th.where(visible[..., None], uv, th.zeros_like(uv))
+        return th.cat([uv.reshape(-1, 8), visible.float()], 1)
+
     def _sample_augmentation(self, idx):
         n, c = len(idx), self.augment_cfg
         if c is None:
@@ -324,6 +346,7 @@ class GateHoverEnv(DroneGymEnvsBase):
         obs = {**teacher, "image": self._frames.clone()}
         if self.n_prev_actions > 0:
             obs["actions"] = self._prev_actions.reshape(self.num_agent, -1).clone()
+        obs["corners"] = self.corner_labels()
         return TensorDict(obs)
 
     def _teacher_observation(self):

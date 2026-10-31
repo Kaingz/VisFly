@@ -860,7 +860,12 @@ class GateImageExtractor(CustomBaseFeaturesExtractor):
     mixed_precision: run the CNN in float16 with channels-last memory layout on the GPU (2x faster on
     an RTX 2080: 88 -> 44 ms per minibatch of 1024; float16 alone gives only 81 ms, as the tensor cores
     need channels last); its output, the heads, the action distribution and the PPO loss stay
-    float32. Needs PPO(mixed_precision=True) for the gradient scaling."""
+    float32. Needs PPO(mixed_precision=True) for the gradient scaling.
+
+    Auxiliary corner task (net_arch "corners": {"layer": [...]}): a head on the CNN's image features
+    predicts where the gate opening's 4 corners are in the newest frame and whether each is visible.
+    Trained only through corner_loss (PPO(aux_loss_coef > 0)) against the env's "corners" labels; it
+    teaches the CNN to find the gate's corners. The policy never uses the head's output."""
 
     def __init__(self, observation_space, net_arch, activation_fn=nn.ReLU, mixed_precision=False):
         self.mixed_precision = mixed_precision
@@ -875,6 +880,8 @@ class GateImageExtractor(CustomBaseFeaturesExtractor):
             image = image.contiguous(memory_format=th.channels_last)
         with th.autocast("cuda", dtype=th.float16, enabled=enabled):
             features = [self.image_extractor(image).float()]
+        if hasattr(self, "corner_head"):
+            self.corner_pred = self.corner_head(features[0])  # kept for corner_loss in the same PPO step
         if hasattr(self, "actions_extractor"):
             features.append(self.actions_extractor(observations["actions"]))
         return th.cat(features, dim=-1)
@@ -882,9 +889,34 @@ class GateImageExtractor(CustomBaseFeaturesExtractor):
     def _build(self, observation_space, net_arch, activation_fn):
         self._features_dim = set_cnn_feature_extractor(
             self, "image", observation_space["image"], net_arch.get("image", {}), activation_fn)
+        image_dim = self._features_dim
         if "actions" in observation_space.spaces:
             self._features_dim += set_mlp_feature_extractor(
                 self, "actions", observation_space["actions"], net_arch.get("actions", {}), activation_fn)
+        if "corners" in net_arch:
+            layers, prev = [], image_dim
+            for width in net_arch["corners"].get("layer", []):
+                layers += [nn.Linear(prev, width), activation_fn()]
+                prev = width
+            self.corner_head = nn.Sequential(*layers, nn.Linear(prev, 12))  # 4 x (u, v), 4 visibility logits
+            self.image_size = observation_space["image"].shape[-1]
+
+    def corner_loss(self, labels):
+        """Loss of the last forward pass's corner prediction against the env's labels (B, 12).
+        Position: smooth L1 on the pixel error / 8 (linear above 1 px), visible corners only;
+        visibility: binary cross-entropy. Returns (loss, dict of numbers for logging)."""
+        pred = self.corner_pred
+        vis = labels[:, 8:]
+        px = self.image_size / 2  # normalised coordinates -> pixels
+        d = (pred[:, :8] - labels[:, :8]).view(-1, 4, 2) * px  # pixel error per coordinate
+        n_vis = vis.sum().clamp(min=1)
+        pos = (nn.functional.smooth_l1_loss(d / 8, th.zeros_like(d), beta=1 / 8, reduction="none").sum(-1) * vis).sum() / n_vis
+        visibility = nn.functional.binary_cross_entropy_with_logits(pred[:, 8:], vis)
+        with th.no_grad():
+            info = {"corner_error_px": ((d.norm(dim=-1) * vis).sum() / n_vis).item(),
+                    "corner_visibility_accuracy": ((pred[:, 8:] > 0).float() == vis).float().mean().item(),
+                    "corner_position_loss": pos.item(), "corner_visibility_loss": visibility.item()}
+        return pos + visibility, info
 
 
 def load_extractor_class(cls):

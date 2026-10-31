@@ -64,10 +64,14 @@ class PPO(ori_PPO):
         "CustomMultiInputPolicy": CustomMultiInputActorCriticPolicy,
     }
 
-    def __init__(self, comment="", save_path=None, scene_freq=None, mixed_precision=False, *args, **kwargs):
+    def __init__(self, comment="", save_path=None, scene_freq=None, mixed_precision=False, aux_loss_coef=0.0,
+                 *args, **kwargs):
         # mixed_precision: scale the loss for float16 parts of the network (e.g. GateImageExtractor's
         # CNN), so that small gradients don't round to zero. A no-op when False.
+        # aux_loss_coef: weight of the actor extractor's auxiliary loss (GateImageExtractor.corner_loss
+        # against the "corners" observation); 0 = off.
         self.mixed_precision = mixed_precision
+        self.aux_loss_coef = aux_loss_coef
         self.comment = comment
         self.name = "PPO"
         self.scene_freq = scene_freq
@@ -197,6 +201,10 @@ class PPO(ori_PPO):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        aux_infos = []
+        extractor = self.policy.features_extractor if self.policy.share_features_extractor \
+            else self.policy.pi_features_extractor
+        use_aux = getattr(self, "aux_loss_coef", 0.0) > 0 and hasattr(extractor, "corner_loss")
 
         if not hasattr(self, "_grad_scaler"):
             self._grad_scaler = th.cuda.amp.GradScaler(enabled=getattr(self, "mixed_precision", False))
@@ -271,6 +279,10 @@ class PPO(ori_PPO):
                         + self.ent_coef * entropy_loss
                         + self.vf_coef * value_loss
                 )
+                if use_aux:  # uses the prediction from evaluate_actions' forward pass above
+                    aux_loss, aux_info = extractor.corner_loss(rollout_data.observations["corners"])
+                    loss = loss + self.aux_loss_coef * aux_loss
+                    aux_infos.append(aux_info)
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -331,6 +343,8 @@ class PPO(ori_PPO):
         )
 
         # Logs
+        for key in (aux_infos[0] if aux_infos else {}):
+            self.logger.record(f"train/{key}", np.mean([info[key] for info in aux_infos]))
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
