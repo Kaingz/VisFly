@@ -64,7 +64,10 @@ class PPO(ori_PPO):
         "CustomMultiInputPolicy": CustomMultiInputActorCriticPolicy,
     }
 
-    def __init__(self, comment="", save_path=None, scene_freq=None, *args, **kwargs):
+    def __init__(self, comment="", save_path=None, scene_freq=None, mixed_precision=False, *args, **kwargs):
+        # mixed_precision: scale the loss for float16 parts of the network (e.g. GateImageExtractor's
+        # CNN), so that small gradients don't round to zero. A no-op when False.
+        self.mixed_precision = mixed_precision
         self.comment = comment
         self.name = "PPO"
         self.scene_freq = scene_freq
@@ -98,6 +101,9 @@ class PPO(ori_PPO):
             #     else f"{self.save_path}/{self.name}_{index}"
             path = f"{self.save_path}/{self.name}_{self.comment}_{index}"
         self.policy_save_path = path if path.endswith(".zip") else f"{path}.zip"
+
+    def _excluded_save_params(self):
+        return super()._excluded_save_params() + ["_grad_scaler"]  # recreated in train()
 
     def check_and_reset_scene(self) -> None:
         if not hasattr(self, "_pre_scene_fresh_step"):
@@ -192,6 +198,10 @@ class PPO(ori_PPO):
         pg_losses, value_losses = [], []
         clip_fractions = []
 
+        if not hasattr(self, "_grad_scaler"):
+            self._grad_scaler = th.cuda.amp.GradScaler(enabled=getattr(self, "mixed_precision", False))
+        scaler = self._grad_scaler
+
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -283,13 +293,15 @@ class PPO(ori_PPO):
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.policy.optimizer)  # clip the true gradients
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.max_grad_norm
                 )
 
-                self.policy.optimizer.step()
+                scaler.step(self.policy.optimizer)  # skips the step if the gradients overflowed
+                scaler.update()
 
             self._n_updates += 1
             if not continue_training:

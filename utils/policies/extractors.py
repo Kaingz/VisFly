@@ -851,6 +851,42 @@ class FlexibleMLP(nn.Module):
         return self.net(x)
 
 
+class GateImageExtractor(CustomBaseFeaturesExtractor):
+    """Camera policy input (GateHoverEnv with n_frames > 0): a CNN on the stacked grayscale frames
+    ("image", uint8, scaled to [0, 1] by the policy's preprocessing) plus an optional MLP on the
+    previous commands ("actions"). net_arch: {"image": {channel, kernel_size, stride, padding, layer},
+    "actions": {layer}}, as in FlexibleExtractor.
+
+    mixed_precision: run the CNN in float16 with channels-last memory layout on the GPU (2x faster on
+    an RTX 2080: 88 -> 44 ms per minibatch of 1024; float16 alone gives only 81 ms, as the tensor cores
+    need channels last); its output, the heads, the action distribution and the PPO loss stay
+    float32. Needs PPO(mixed_precision=True) for the gradient scaling."""
+
+    def __init__(self, observation_space, net_arch, activation_fn=nn.ReLU, mixed_precision=False):
+        self.mixed_precision = mixed_precision
+        super().__init__(observation_space, net_arch, activation_fn)
+        if mixed_precision:
+            self.image_extractor.to(memory_format=th.channels_last)
+
+    def extract(self, observations) -> th.Tensor:
+        image = observations["image"]
+        enabled = self.mixed_precision and image.is_cuda
+        if enabled:
+            image = image.contiguous(memory_format=th.channels_last)
+        with th.autocast("cuda", dtype=th.float16, enabled=enabled):
+            features = [self.image_extractor(image).float()]
+        if hasattr(self, "actions_extractor"):
+            features.append(self.actions_extractor(observations["actions"]))
+        return th.cat(features, dim=-1)
+
+    def _build(self, observation_space, net_arch, activation_fn):
+        self._features_dim = set_cnn_feature_extractor(
+            self, "image", observation_space["image"], net_arch.get("image", {}), activation_fn)
+        if "actions" in observation_space.spaces:
+            self._features_dim += set_mlp_feature_extractor(
+                self, "actions", observation_space["actions"], net_arch.get("actions", {}), activation_fn)
+
+
 def load_extractor_class(cls):
     cls_alias = {
         "StateExtractor": StateExtractor,
@@ -864,6 +900,7 @@ def load_extractor_class(cls):
         "EmptyExtractor": EmptyExtractor,
         "LatentCombineExtractor": LatentCombineExtractor,
         "FlexibleExtractor": FlexibleExtractor,
+        "GateImageExtractor": GateImageExtractor,
     }
     if cls in cls_alias.keys():
         return cls_alias[cls]

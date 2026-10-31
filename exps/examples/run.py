@@ -18,6 +18,7 @@ from VisFly.envs.LandingEnv import LandingEnv
 from VisFly.envs.MultiNavigationEnv import MultiNavigationEnv
 from VisFly.envs.NavigationEnv import NavigationEnv
 from VisFly.utils.algorithms.PPO import PPO
+from VisFly.utils.algorithms.image_buffer import ImageDictRolloutBuffer
 from VisFly.utils.common import load_yaml_config
 from VisFly.utils.policies import extractors
 
@@ -28,6 +29,7 @@ ENV_ALIAS = {
     "landing": LandingEnv,
     "gate_hover_teacher_nominal": GateHoverEnv,
     "gate_hover_teacher": GateHoverEnv,
+    "gate_hover_camera": GateHoverEnv,
 }
 
 ALG_ALIAS = {
@@ -38,6 +40,11 @@ EXTRACTOR_ALIAS = {
     "StateTargetImageExtractor": extractors.StateTargetImageExtractor,
     "SwarmStateTargetImageExtractor": extractors.SwarmStateTargetImageExtractor,
     "FlexibleExtractor": extractors.FlexibleExtractor,
+    "GateImageExtractor": extractors.GateImageExtractor,
+}
+
+BUFFER_ALIAS = {
+    "ImageDictRolloutBuffer": ImageDictRolloutBuffer,
 }
 
 TORCH_ALIAS = {
@@ -75,6 +82,8 @@ def resolve_config(value: Any) -> Any:
             return EXTRACTOR_ALIAS[value]
         if value in TORCH_ALIAS:
             return TORCH_ALIAS[value]
+        if value in BUFFER_ALIAS:
+            return BUFFER_ALIAS[value]
     return value
 
 
@@ -105,14 +114,26 @@ def main(default_env: str = "cluttered_flight") -> None:
                 **alg_config["algorithm"],
             )
         learn_config = dict(alg_config["learn"])
+        callbacks = []
         checkpoint_freq = learn_config.pop("checkpoint_freq", None)  # in environment steps
         if checkpoint_freq:
             from stable_baselines3.common.callbacks import CheckpointCallback
-            learn_config["callback"] = CheckpointCallback(
+            callbacks.append(CheckpointCallback(
                 save_freq=max(1, checkpoint_freq // env.num_envs),
-                save_path=model.policy_save_path[:-len(".zip")] + "_checkpoints", name_prefix="ckpt")
+                save_path=model.policy_save_path[:-len(".zip")] + "_checkpoints", name_prefix="ckpt"))
+        eval_freq = learn_config.pop("eval_freq", None)  # in environment steps
+        if eval_freq:
+            # flights of the current policy in a separate env: eval/* in TensorBoard, picture and video
+            # in <run>_eval/ (tools/policy_viz.py)
+            from tools.policy_viz import EvalCallback
+            callbacks.append(EvalCallback(env_config["env"], eval_freq,
+                                          out_dir=model.policy_save_path[:-len(".zip")] + "_eval"))
+        if callbacks:
+            from stable_baselines3.common.callbacks import CallbackList
+            learn_config["callback"] = CallbackList(callbacks)
         model.learn(**learn_config)
         model.save()
+        env.close()
         return
 
     if args.weight is None:

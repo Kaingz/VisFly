@@ -1,8 +1,12 @@
 """Fly from a random start in the room to a hover point in front of the gate and hold it.
 
-Phase 4 (state-based teacher): the actor sees the true state relative to the hover point plus
-its own previous commands; the critic additionally sees the randomised physical parameters
-(asymmetric actor-critic). Camera observations come in phase 5.
+Phase 4 (state-based teacher, n_frames = 0): the actor sees the true state relative to the hover
+point plus its own previous commands; the critic additionally sees the randomised physical
+parameters (asymmetric actor-critic).
+
+Phase 5 (camera policy, n_frames > 0): the actor sees the last n_frames grayscale camera images
+("image", uint8, newest first) plus its previous commands ("actions"); the critic sees exactly the
+teacher's inputs ("state", "privileged_state").
 
 Gate geometry, layout and camera projection come from tools/gate_geometry.py (repo root must be
 on sys.path, as in exps/examples/run.py). The gate pose comes from a scene's .gate.json sidecar.
@@ -13,6 +17,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch as th
+import torch.nn.functional as F
 from gymnasium import spaces
 
 from tools import gate_geometry as gg
@@ -28,6 +33,17 @@ DEFAULT_START = {
     "speed": 0.3,                # m/s per axis
     "rate": 0.3,                 # rad/s per axis
     "require_opening_in_view": True,
+}
+DEFAULT_SCENE = "VisFly/datasets/visfly-beta/configs/scenes/gate_room"
+DEFAULT_AUGMENT = {
+    # camera-like image changes. "Per episode" values are drawn per drone at each reset (exposure,
+    # camera response, focus); the others change every frame
+    "gain": [0.5, 1.3],          # per episode: brightness factor (the gate room renders bright already)
+    "gamma": [0.7, 1.4],         # per episode: response curve
+    "offset": [-20.0, 20.0],     # per episode: black level, gray values
+    "blur_sigma": [0.0, 1.0],    # per episode: Gaussian blur, px at image_size
+    "noise_std": [1.0, 6.0],     # per episode: level of per-pixel noise, gray values
+    "frame_gain": 0.05,          # per frame: relative brightness jitter (auto exposure)
 }
 DEFAULT_REWARD = {
     # every term that is paid each step is positive or small, so that staying alive is always worth
@@ -116,7 +132,17 @@ class GateHoverEnv(DroneGymEnvsBase):
             reward_kwargs: Optional[Dict] = None,
             drone_radius: float = 0.07,
             max_tilt_deg: float = 60.0,
+            n_frames: int = 0,
+            image_size: int = 128,
+            render_size: int = 128,
+            augment=None,
+            image_device: Optional[str] = None,
     ):
+        """n_frames > 0 switches to camera observations (phase 5). render_size is the rendered
+        resolution; larger values are downsampled to image_size (pixel averaging, like the
+        real 320 x 320 -> image_size step). augment: dict overriding DEFAULT_AUGMENT, or False.
+        image_device: where grayscale conversion, downsampling and augmentation run (default: the
+        GPU if available; on the CPU they took 70 of 128 ms per step with 64 drones)."""
         with open(gate_pose_file) as f:
             pose = json.load(f)
         self.gate_pos, self.gate_yaw = pose["gate_pos"], pose["gate_yaw"]
@@ -126,6 +152,19 @@ class GateHoverEnv(DroneGymEnvsBase):
         self.n_prev_actions = n_prev_actions
         self.drone_radius = drone_radius
         self.cos_max_tilt = math.cos(math.radians(max_tilt_deg))
+        self.n_frames, self.image_size, self.render_size = n_frames, image_size, render_size
+        self.image_device = th.device(image_device or ("cuda" if th.cuda.is_available() else "cpu"))
+        self.augment_cfg = None if augment is False else {**DEFAULT_AUGMENT, **(augment or {})}
+        is_collision_reset = True
+        if n_frames > 0:
+            import habitat_sim
+            visual = True
+            fwd, left, up = gg.CAMERA_OFFSET_BODY
+            sensor_kwargs = [{"sensor_type": habitat_sim.SensorType.COLOR, "uuid": "color",
+                              "resolution": [render_size, render_size], "hfov": gg.CAMERA_HFOV_DEG,
+                              "position": [-left, up, -fwd]}]  # Habitat axes: x right, y up, -z forward
+            scene_kwargs = {"path": DEFAULT_SCENE, **scene_kwargs}
+            is_collision_reset = False  # get_failure covers walls and gate (with the crash penalty)
 
         super().__init__(
             num_agent_per_scene=num_agent_per_scene,
@@ -140,6 +179,7 @@ class GateHoverEnv(DroneGymEnvsBase):
             device=device,
             max_episode_steps=max_episode_steps,
             tensor_output=tensor_output,
+            is_collision_reset=is_collision_reset,
         )
         # replace the default start generators
         gen = GateStartGenerator(self.gate_pos, self.gate_yaw, self.room, self.start_cfg, seed=seed)
@@ -159,10 +199,21 @@ class GateHoverEnv(DroneGymEnvsBase):
         self._prev_actions = self.hover_action.repeat(self.num_agent, n_prev_actions, 1)
         self._prev_dist = th.zeros(self.num_agent)
         n_priv = dyn.randomized_params.shape[1]
-        self.observation_space = spaces.Dict({
+        obs_spaces = {
             "state": spaces.Box(low=-np.inf, high=np.inf, shape=(15 + 4 * n_prev_actions,), dtype=np.float32),
             "privileged_state": spaces.Box(low=-np.inf, high=np.inf, shape=(n_priv,), dtype=np.float32),
-        })
+        }
+        if n_frames > 0:
+            obs_spaces["image"] = spaces.Box(low=0, high=255, shape=(n_frames, image_size, image_size), dtype=np.uint8)
+            if n_prev_actions > 0:
+                obs_spaces["actions"] = spaces.Box(low=-1, high=1, shape=(4 * n_prev_actions,), dtype=np.float32)
+            self._frames = th.zeros((self.num_agent, n_frames, image_size, image_size), dtype=th.uint8)
+            self._aug = {}
+            self._sample_augmentation(th.arange(self.num_agent))
+            self._push_frame = False   # step(): a new frame was rendered for every drone
+            self._fill_frames = None   # reset: these drones start a new stack from their first frame
+            self._img_rng = th.Generator(device=self.image_device).manual_seed(seed)
+        self.observation_space = spaces.Dict(obs_spaces)
 
     # ---------- geometry helpers ----------
     def _build_collision_boxes(self):
@@ -204,8 +255,78 @@ class GateHoverEnv(DroneGymEnvsBase):
             th.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], 1),
         ], 1)  # body -> world, (N, 3, 3)
 
+    # ---------- camera images ----------
+    def _sample_augmentation(self, idx):
+        n, c = len(idx), self.augment_cfg
+        if c is None:
+            values = {"gain": th.ones(n), "gamma": th.ones(n), "offset": th.zeros(n), "blur_sigma": th.zeros(n),
+                      "noise_std": th.zeros(n)}
+        else:
+            values = {k: th.empty(n).uniform_(*c[k]) for k in ("gain", "gamma", "offset", "blur_sigma", "noise_std")}
+        for k, v in values.items():
+            self._aug.setdefault(k, th.zeros(self.num_agent))[idx] = v
+
+    def _blur(self, x, sigma):
+        """Gaussian blur with a different sigma per image. x: (n, 1, H, W) float."""
+        r = 3
+        t = th.arange(-r, r + 1, dtype=th.float32, device=x.device)
+        k = th.exp(-0.5 * (t / sigma.clamp(min=1e-3)[:, None]) ** 2)
+        k = k / k.sum(1, keepdim=True)                       # (n, 7); sigma ~0 gives a delta
+        n = len(x)
+        y = F.conv2d(F.pad(x.transpose(0, 1), (r, r, 0, 0), mode="replicate"), k[:, None, None, :], groups=n)
+        y = F.conv2d(F.pad(y, (0, 0, r, r), mode="replicate"), k[:, None, :, None], groups=n)
+        return y.transpose(0, 1)
+
+    def _color_images(self, idx):
+        """Rendered images of drones idx as a uint8 tensor (n, R, R, C). VisFly keeps them as a
+        transposed (N, 3, R, R) view of Habitat's contiguous (N, R, R, 4) RGBA array; gathering from
+        the view costs ~20 ms per step with 64 drones, so read the array underneath when possible."""
+        view = self.envs.sensor_obs["color"]
+        base = view.base
+        if isinstance(base, np.ndarray) and base.ndim == 4 and base.shape[:3] == (self.num_agent, *view.shape[2:]) \
+                and base.flags["C_CONTIGUOUS"] and np.shares_memory(base, view):
+            return th.from_numpy(base if len(idx) == self.num_agent else base[idx.numpy()])
+        return th.from_numpy(np.ascontiguousarray(view[idx.numpy()].transpose(0, 2, 3, 1)))
+
+    def _render_frames(self, idx):
+        """Current camera images of drones idx as augmented uint8 grayscale (n, S, S)."""
+        dev = self.image_device
+        rgb = self._color_images(idx).to(dev).permute(0, 3, 1, 2)[:, :3].float()  # (n, 3, R, R), 0..255
+        gray = (0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2])[:, None] / 255.0
+        if self.render_size != self.image_size:
+            gray = F.adaptive_avg_pool2d(gray, self.image_size)
+        if self.augment_cfg is not None:
+            a = {k: v[idx].to(dev)[:, None, None, None] for k, v in self._aug.items()}
+            gray = self._blur(gray, a["blur_sigma"][:, 0, 0, 0])
+            jitter = 1 + self.augment_cfg["frame_gain"] * (
+                2 * th.rand(len(idx), generator=self._img_rng, device=dev) - 1)[:, None, None, None]
+            gray = (gray * a["gain"] * jitter).clamp(0, 1) ** a["gamma"]
+            gray = gray * 255 + a["offset"] + a["noise_std"] * th.randn(gray.shape, generator=self._img_rng, device=dev)
+        else:
+            gray = gray * 255
+        return gray[:, 0].round().clamp(0, 255).to(th.uint8).cpu()
+
+    def _update_frames(self):
+        if self._push_frame:  # after a step: shift every stack by one, newest frame first
+            self._frames = th.cat([self._render_frames(th.arange(self.num_agent))[:, None], self._frames[:, :-1]], 1)
+            self._push_frame = False
+        if self._fill_frames is not None:  # after a reset: no history yet, repeat the first frame
+            idx = self._fill_frames
+            self._frames[idx] = self._render_frames(idx)[:, None].expand(-1, self.n_frames, -1, -1)
+            self._fill_frames = None
+
     # ---------- VisFly interface ----------
     def get_observation(self, indices=None, predicted_obs=None) -> TensorDict:
+        teacher = self._teacher_observation()
+        if self.n_frames == 0:
+            return TensorDict(teacher)
+        self._update_frames()
+        obs = {**teacher, "image": self._frames.clone()}
+        if self.n_prev_actions > 0:
+            obs["actions"] = self._prev_actions.reshape(self.num_agent, -1).clone()
+        return TensorDict(obs)
+
+    def _teacher_observation(self):
         pos, vel, rate = self.position.cpu(), self.velocity.cpu(), self.angular_velocity.cpu()
         R = self._rotation_matrices()
         R_rel = self.R_gate.T @ R                       # body -> gate frame
@@ -217,10 +338,7 @@ class GateHoverEnv(DroneGymEnvsBase):
             rate / 3.0,
             self._prev_actions.reshape(self.num_agent, -1),
         ], dim=1)
-        return TensorDict({
-            "state": state,
-            "privileged_state": self.envs.dynamics.randomized_params.cpu(),
-        })
+        return {"state": state, "privileged_state": self.envs.dynamics.randomized_params.cpu()}
 
     def get_success(self) -> th.Tensor:
         return th.zeros(self.num_agent, dtype=th.bool)  # hold until the time limit, never end early
@@ -279,6 +397,7 @@ class GateHoverEnv(DroneGymEnvsBase):
     def step(self, _action, is_test=False):
         a = th.as_tensor(_action, dtype=th.float32).cpu()
         self._prev_actions = th.cat([a.unsqueeze(1), self._prev_actions[:, :-1]], dim=1)
+        self._push_frame = self.n_frames > 0
         out = super().step(self.policy_to_dynamics(a).clamp(-1, 1), is_test=is_test)
         self._prev_dist = self._distance()[0]  # reset drones already have their new start here
         return out
@@ -286,6 +405,9 @@ class GateHoverEnv(DroneGymEnvsBase):
     def reset(self, *args, **kwargs):
         self._prev_actions = self.hover_action.repeat(self.num_agent, self.n_prev_actions, 1)
         self._failure = th.zeros(self.num_agent, dtype=th.bool)
+        if self.n_frames > 0:
+            self._sample_augmentation(th.arange(self.num_agent))
+            self._fill_frames = th.arange(self.num_agent)
         obs = super().reset(*args, **kwargs)
         self._prev_dist = self._distance()[0]
         return obs
@@ -293,4 +415,7 @@ class GateHoverEnv(DroneGymEnvsBase):
     def reset_agent_by_id(self, agent_indices=None, state=None, reset_obs=None):
         idx = th.as_tensor(agent_indices, dtype=th.long)
         self._prev_actions[idx] = self.hover_action  # the delay buffer is filled with hover, too
+        if self.n_frames > 0:
+            self._sample_augmentation(idx)
+            self._fill_frames = idx
         return super().reset_agent_by_id(agent_indices, state=state, reset_obs=reset_obs)
