@@ -30,6 +30,7 @@ ENV_ALIAS = {
     "gate_hover_teacher_nominal": GateHoverEnv,
     "gate_hover_teacher": GateHoverEnv,
     "gate_hover_camera": GateHoverEnv,
+    "gate_hover_camera_fp32": GateHoverEnv,
 }
 
 ALG_ALIAS = {

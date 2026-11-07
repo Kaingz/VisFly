@@ -1,0 +1,48 @@
+# Copy of gate_hover_camera.yaml for the float32 control run (alg_cfgs/gate_hover_camera_fp32).
+# Phase 5a: camera policy in the gate room (one room, image augmentation only), physics and delay
+# randomised as for the teacher. The actor sees "image" (last n_frames grayscale frames) and
+# "actions" (last n_prev_actions commands); the critic sees the teacher's "state" and
+# "privileged_state". Details: VisFly/envs/GateHoverEnv.py, docs/phase5-plan.md.
+env:
+  num_agent_per_scene: 64
+  num_scene: 1
+  device: cpu
+  max_episode_steps: 300          # 15 s at 20 Hz
+  hover_distance: 1.0
+  n_frames: 4                     # stacked camera frames (variants A-D)
+  n_prev_actions: 4               # previous commands (variants A-D)
+  image_size: 128
+  render_size: 256                # averaged down to 128, like the real 320 x 320 image (128 direct is aliased)
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335     # 1/300 s
+    ctrl_dt: 0.05                 # 20 Hz
+    action_type: bodyrate
+    ctrl_delay: True
+    comm_delay: 0.1
+    randomization:
+      mass: 0.05
+      thrust_gain: 0.10
+      inertia: 0.15
+      kappa: 0.3
+      drag: 0.3
+      motor_tau: [0.05, 0.09]
+      rate_p: [60, 130]
+      yaw_p: [3, 8]
+      delay: [0.05, 0.2]
+
+eval_env:
+  num_agent_per_scene: 4
+  num_scene: 1
+  device: cpu
+  max_episode_steps: 300
+  n_frames: 4
+  n_prev_actions: 4
+  image_size: 128
+  render_size: 256
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335
+    ctrl_dt: 0.05
+    action_type: bodyrate
+    comm_delay: 0.1

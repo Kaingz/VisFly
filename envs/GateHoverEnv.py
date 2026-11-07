@@ -121,8 +121,8 @@ class GateHoverEnv(DroneGymEnvsBase):
             visual: bool = False,
             requires_grad: bool = False,
             random_kwargs: dict = None,
-            dynamics_kwargs: dict = {},
-            scene_kwargs: dict = {},
+            dynamics_kwargs: dict = None,
+            scene_kwargs: dict = None,
             sensor_kwargs: list = [],
             device: str = "cpu",
             max_episode_steps: int = 300,
@@ -157,6 +157,9 @@ class GateHoverEnv(DroneGymEnvsBase):
         self.n_frames, self.image_size, self.render_size = n_frames, image_size, render_size
         self.image_device = th.device(image_device or ("cuda" if th.cuda.is_available() else "cpu"))
         self.augment_cfg = None if augment is False else {**DEFAULT_AUGMENT, **(augment or {})}
+        # copies: VisFly's base env writes into these dicts (a state-only env sets scene_kwargs["path"]
+        # to an empty box), which with a shared default made later camera envs render the wrong scene
+        dynamics_kwargs, scene_kwargs = dict(dynamics_kwargs or {}), dict(scene_kwargs or {})
         is_collision_reset = True
         if n_frames > 0:
             import habitat_sim
