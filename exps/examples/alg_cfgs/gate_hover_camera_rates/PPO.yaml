@@ -1,0 +1,62 @@
+# Control-rate experiment: same as gate_hover_camera (fine-tuned from PPO_5a2_1 via run.py --init), 10M steps.
+# Phase 5a: camera policy. Actor: CNN on the frame stack + MLP on the previous commands.
+# Critic: the teacher's inputs (true state and randomised parameters), no images.
+algorithm:
+  policy: CustomMultiInputPolicy
+  policy_kwargs:
+    ortho_init: False
+    log_std_init: -1.0
+    share_features_extractor: False
+    pi_features_extractor_class: GateImageExtractor
+    pi_features_extractor_kwargs:
+      mixed_precision: True       # CNN in float16, channels last (2x faster); heads and PPO loss stay float32
+      net_arch:
+        image:                    # 128 -> 64 -> 32 -> 16 -> 8, then 4096 -> 256
+          channel: [32, 64, 64, 64]
+          kernel_size: [5, 3, 3, 3]
+          stride: [2, 2, 2, 2]
+          padding: [2, 1, 1, 1]
+          layer: [256]
+        actions:
+          layer: [64]
+        corners:                  # auxiliary head: opening corners in the newest frame (training only)
+          layer: [128]
+    vf_features_extractor_class: FlexibleExtractor
+    vf_features_extractor_kwargs:
+      net_arch:
+        state:
+          layer: [256]
+        privileged_state:
+          layer: [64]
+    net_arch:
+      pi: [256, 128]
+      vf: [256, 128]
+    activation_fn: ReLU
+  rollout_buffer_class: ImageDictRolloutBuffer   # images stay uint8 (4x less RAM)
+  mixed_precision: True           # loss scaling for the float16 CNN
+  aux_loss_coef: 1.0              # weight of the corner loss (about 0.1-1 per unit; see GateImageExtractor.corner_loss)
+  verbose: 1
+  gamma: 0.99
+  n_steps: 256                    # x 64 drones = 16384 samples per iteration (about 1 GB of images)
+  batch_size: 1024                # 2.7 GB GPU peak; 2048 needs 5.3 GB, 4096 overflows the 8 GB
+  n_epochs: 10
+  learning_rate: 1.0e-4           # 3e-4 in the first 5a run: KL 0.04-0.09 per iteration, stopped every update early
+  gae_lambda: 0.95
+  clip_range: 0.2
+  target_kl: 0.05                 # stops above 0.075; normal for this policy is 0.02-0.06 (see phase5-plan.md, 5a)
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  device: cuda
+
+learn:
+  total_timesteps: 10000000
+  checkpoint_freq: 1000000        # environment steps
+  eval_freq: 1000000              # flights of the current policy: TensorBoard eval/*, <run>_eval/*.png, .mp4
+
+test:
+  is_fig: True
+  is_fig_save: True
+  is_video: False
+  is_video_save: True
+  render_kwargs: {}

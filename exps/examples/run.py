@@ -31,6 +31,8 @@ ENV_ALIAS = {
     "gate_hover_teacher": GateHoverEnv,
     "gate_hover_camera": GateHoverEnv,
     "gate_hover_camera_fp32": GateHoverEnv,
+    "gate_hover_camera_rates": GateHoverEnv,
+    "gate_hover_camera_5b": GateHoverEnv,
 }
 
 ALG_ALIAS = {
@@ -68,6 +70,9 @@ def parse_args(default_env: str = "cluttered_flight"):
     parser.add_argument("--env", "-e", type=str, default=default_env)
     parser.add_argument("--seed", "-s", type=int, default=42)
     parser.add_argument("--weight", "-w", type=str, default=None)
+    parser.add_argument("--init", "-i", type=str, default=None,
+                        help="training: start from this model's weights (and optimizer state), with the current "
+                             "config and a new run name (-w instead resumes the old run with its old settings)")
     return parser
 
 
@@ -114,6 +119,8 @@ def main(default_env: str = "cluttered_flight") -> None:
                 save_path=save_folder,
                 **alg_config["algorithm"],
             )
+            if args.init is not None:  # fine-tuning: weights only, everything else from the config
+                model.set_parameters(args.init, exact_match=True, device=model.device)
         learn_config = dict(alg_config["learn"])
         callbacks = []
         checkpoint_freq = learn_config.pop("checkpoint_freq", None)  # in environment steps

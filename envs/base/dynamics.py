@@ -117,9 +117,9 @@ class Dynamics:
         self._rate_p = self._nominal_rate_p.repeat(1, n)
         self._rate_d = self._nominal_rate_d.repeat(1, n)
         self._delay = th.full((n,), self._comm_delay, device=dev)
-        max_delay = self._randomization.get("delay", [self._comm_delay, self._comm_delay])[1]
+        self._max_delay = self._randomization.get("delay", [self._comm_delay, self._comm_delay])[1]
         # command history, newest first; a command is applied once it is older than the drone's delay
-        self._cmd_buffer_len = math.ceil(round(max_delay / self.dt) / self._interval_steps) + 1
+        self._cmd_buffer_len = math.ceil(round(self._max_delay / self.dt) / self._interval_steps) + 1
         self._hover_action = self._normalize(th.tensor([[-g[2].item(), 0., 0., 0.]], device=dev)).float() \
             if self.action_type == ACTION_TYPE.BODYRATE else th.zeros((1, 4), device=dev)
         self._cmd_buffer = self._hover_action.reshape(1, 1, 4).repeat(self._cmd_buffer_len, n, 1)
@@ -154,6 +154,20 @@ class Dynamics:
         self._rate_p[:, indices], self._rate_d[:, indices] = p, d
         self._delay[indices] = u(*r["delay"])[0] if "delay" in r else self._comm_delay
         self._cmd_buffer[:, indices] = self._hover_action
+
+    def set_ctrl_dt(self, ctrl_dt):
+        """Change the control period while running (to randomise the control rate). Must be a multiple
+        of dt. Buffered commands keep their age in control steps, so for one delay length after the
+        change the delay is off by the ratio of the periods."""
+        n = round(ctrl_dt / self.dt)
+        if abs(n * self.dt - ctrl_dt) > 1e-9:
+            raise ValueError("ctrl_dt should be a multiple of dt")
+        self.ctrl_dt, self._interval_steps = ctrl_dt, n
+        need = math.ceil(round(self._max_delay / self.dt) / n) + 1
+        if need > self._cmd_buffer_len:  # shorter period: more control steps fit into the delay
+            extra = self._cmd_buffer[-1:].repeat(need - self._cmd_buffer_len, 1, 1)
+            self._cmd_buffer = th.cat([self._cmd_buffer, extra])
+            self._cmd_buffer_len = need
 
     @property
     def randomized_params(self):

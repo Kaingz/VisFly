@@ -148,6 +148,10 @@ class SceneManager(ABC):
         self.num_scene = num_scene
         self.num_agent_per_scene = num_agent_per_scene
         self.num_agent = self.num_agent_per_scene * self.num_scene
+        self.scene_paths = [None] * num_scene  # path of the scene loaded in each slot
+        self.on_scenes_loaded = None           # optional callback(scene_paths) after (re)loading scenes
+        self.sensor_rotations = {}             # drone index -> magnum Quaternion for all its sensors (camera
+                                               # mount error), reapplied after every agent reset
         self.seed = seed
         self.sensor_settings = sensor_settings
         self.reset_settings = reset_settings
@@ -837,6 +841,7 @@ class SceneManager(ABC):
             if self.scenes[scene_id] is not None:
                 self.scenes[scene_id].close()
             self.scenes[scene_id] = self._load_scene(scene_path)
+            self.scene_paths[scene_id] = scene_path
             self._scene_bounds[scene_id] = self.scenes[scene_id].get_active_scene_graph().get_root_node().cumulative_bb
             # if self.is_find_path:
             #     self.path_finders[scene_id].bounds = self._scene_bounds[scene_id]
@@ -889,6 +894,8 @@ class SceneManager(ABC):
 
         if self._obj_ctrls[0]:
             self._update_dynamics()
+        if self.on_scenes_loaded is not None:
+            self.on_scenes_loaded(list(self.scene_paths))
 
     def _load_scene(self, scene_path) -> habitat_sim.Simulator:
         """_summary_
@@ -967,6 +974,10 @@ class SceneManager(ABC):
                 rotation=quaternion.from_float_array(orientation),
             )
         )
+        q = self.sensor_rotations.get(scene_id * self.num_agent_per_scene + agent_id)
+        if q is not None:  # set_state put the sensors back to their configured pose
+            for sensor in self.agents[scene_id][agent_id]._sensors.values():
+                sensor.node.rotation = q
 
     def reset_scenes(self, indices):
         """

@@ -1,0 +1,53 @@
+# Phase 5b: camera policy with visual variety. 16 generated training rooms (tools/variety.py:
+# room sizes, wall/floor/ceiling textures with baked lighting, 8 gate materials, distractors incl.
+# gate-like frames), one room at a time for all drones, switching every scene_switch_steps steps
+# (episodes end as time-outs there). Camera mount error +-3 deg per episode on top of the 5a
+# augmentation. Physics and delay randomised as in 5a. Held out: gate_rooms_test, gate_rooms_lab.
+env:
+  num_agent_per_scene: 64
+  num_scene: 1
+  device: cpu
+  max_episode_steps: 300          # 15 s at 20 Hz
+  scene_kwargs:
+    path: VisFly/datasets/visfly-beta/configs/scenes/gate_rooms_train
+  scene_switch_steps: 1024        # about 51 s, 3-4 episodes per drone and room; a switch takes ~1.5 s
+  augment:
+    cam_tilt_deg: 3.0             # camera mount error per episode (the rest as DEFAULT_AUGMENT)
+  hover_distance: 1.0
+  n_frames: 4                     # stacked camera frames (variants A-D)
+  n_prev_actions: 4               # previous commands (variants A-D)
+  image_size: 128
+  render_size: 256                # averaged down to 128, like the real 320 x 320 image (128 direct is aliased)
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335     # 1/300 s
+    ctrl_dt: 0.05                 # 20 Hz
+    action_type: bodyrate
+    ctrl_delay: True
+    comm_delay: 0.1
+    randomization:
+      mass: 0.05
+      thrust_gain: 0.10
+      inertia: 0.15
+      kappa: 0.3
+      drag: 0.3
+      motor_tau: [0.05, 0.09]
+      rate_p: [60, 130]
+      yaw_p: [3, 8]
+      delay: [0.05, 0.2]
+
+eval_env:
+  num_agent_per_scene: 4
+  num_scene: 1
+  device: cpu
+  max_episode_steps: 300
+  n_frames: 4
+  n_prev_actions: 4
+  image_size: 128
+  render_size: 256
+  dynamics_kwargs:
+    cfg: crazyflie
+    dt: 0.0033333333333333335
+    ctrl_dt: 0.05
+    action_type: bodyrate
+    comm_delay: 0.1
